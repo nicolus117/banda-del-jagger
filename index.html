@@ -39,7 +39,8 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtDate=s=>s?new Date(s+'T12:00:00').toLocaleDateString('es-AR',{day:'numeric',month:'short'}):'';
 const localISO=d=>{const x=new Date(d);return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}-${String(x.getDate()).padStart(2,'0')}`};
-selectedDate=localISO(new Date());calendarMonth=selectedDate.slice(0,7);
+  selectedDate=localISO(new Date());calendarMonth=selectedDate.slice(0,7);
+
 function toast(msg){const t=$('toast');t.textContent=msg;t.classList.remove('hide');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.add('hide'),3000)}
 function friendlyError(e){const m=e?.message||String(e||'Ocurrió un error');console.error(e);if(/row-level security|permission denied/i.test(m))return 'La base de datos bloqueó esta acción por permisos. Revisá que el SQL de configuración esté aplicado.';if(/duplicate key|unique constraint/i.test(m))return 'Ya existe un registro equivalente o ya votaste en esta opción.';return m}
 function showError(e){toast(friendlyError(e))}
