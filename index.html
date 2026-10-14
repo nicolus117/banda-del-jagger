@@ -97,7 +97,26 @@ function shortUser(id){return id===session?.user?.id?(profile?.full_name||'vos')
 function createIdea(){return `<button class="back" onclick="go('Propuestas')">← Volver</button>${heading('Nueva idea','Crear propuesta','Compartí el plan que te gustaría hacer.')}<form onsubmit="saveIdea(event)" class="card"><div class="formrow"><label for="ititle">¿Qué proponés?</label><input class="field" id="ititle" maxlength="140" required placeholder="Ej.: Escapada a la costa"></div><div class="formrow"><label for="idesc">Contanos un poco más</label><textarea class="field" id="idesc" maxlength="1000" placeholder="Fecha, lugar, idea general…"></textarea></div><button class="btn full">Publicar propuesta</button></form>`}
 async function saveIdea(e){e.preventDefault();try{const {error}=await db.from('proposals').insert({title:$('ititle').value.trim(),description:$('idesc').value.trim()||null,proposed_by:session.user.id});if(error)throw error;toast('¡Propuesta publicada!');await refresh();page='Propuestas';await render()}catch(e){showError(e)}}
 function eventCard(e){const date=e.starts_at?new Date(e.starts_at):null;return `<article class="card"><div class="card-top"><div><div class="event-date">${date?date.toLocaleDateString('es-AR',{weekday:'short',day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'}):'Fecha a confirmar'}</div><h3 style="margin-top:5px">📅 ${esc(e.title)}</h3><p class="muted">${esc(e.description||'Detalles a confirmar')}</p></div>${delButton('calendar_events',e.id)}</div></article>`}
-function eventsPage(){return `${heading('Que no se nos pase','Calendario compartido','Un calendario único para los planes de toda la banda.')}<div class="row" style="margin:16px 0"><button class="btn" onclick="go('Crear evento')">＋ Agregar evento</button></div>${calendar()}<div class="section-head"><h2>Todos los eventos</h2></div>${data.events.length?[...data.events].sort((a,b)=>new Date(a.starts_at)-new Date(b.starts_at)).map(eventCard).join(''):empty('📅','Calendario vacío','Creá el primer evento para organizarse.')}`}
+
+function eventsPage(){
+  const today=new Date();
+  today.setHours(0,0,0,0);
+
+  const limit=new Date(today);
+  limit.setDate(limit.getDate()+15);
+  limit.setHours(23,59,59,999);
+
+  const upcoming=[...data.events]
+    .filter(e=>{
+      if(!e.starts_at)return false;
+      const date=new Date(e.starts_at);
+      return !isNaN(date.getTime())&&date>=today&&date<=limit;
+    })
+    .sort((a,b)=>new Date(a.starts_at)-new Date(b.starts_at));
+
+  return `${heading('Que no se nos pase','Calendario compartido','Un calendario único para los planes de toda la banda.')}<div class="row" style="margin:16px 0"><button class="btn" onclick="go('Crear evento')">＋ Agregar evento</button></div>${calendar()}<div class="section-head"><h2>Todos los eventos</h2></div>${upcoming.length?upcoming.map(eventCard).join(''):empty('📅','No hay próximos eventos','No hay eventos programados para los próximos 15 días.')}`;
+}
+
 function calendar(){const [y,m]=calendarMonth.split('-').map(Number),first=new Date(y,m-1,1),offset=(first.getDay()+6)%7,days=new Date(y,m,0).getDate(),labels=['Lu','Ma','Mi','Ju','Vi','Sá','Do'];let cells=labels.map(x=>`<div class="daylabel">${x}</div>`).join('');for(let i=0;i<offset;i++)cells+='<div></div>';for(let d=1;d<=days;d++){const key=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`,has=data.events.some(e=>e.starts_at&&localISO(new Date(e.starts_at))===key);cells+=`<button class="day ${selectedDate===key?'selected':''} ${key===localISO(new Date())?'today':''}" onclick="selectDate('${key}')">${d}${has?'<span class="dot"></span>':''}</button>`}const monthName=first.toLocaleDateString('es-AR',{month:'long',year:'numeric'});const selected=data.events.filter(e=>e.starts_at&&localISO(new Date(e.starts_at))===selectedDate);return `<div class="card"><div class="calendar-head"><button class="btn secondary" onclick="shiftMonth(-1)">‹</button><b style="text-transform:capitalize">${esc(monthName)}</b><button class="btn secondary" onclick="shiftMonth(1)">›</button></div><div class="days">${cells}</div><div class="section-head"><h3>${selectedDate?`Planes del ${fmtDate(selectedDate)}`:'Elegí una fecha'}</h3><button class="btn ghost" onclick="createEventForSelected()">＋</button></div>${selected.length?selected.map(eventCard).join(''):'<p class="subtle">No hay eventos para esta fecha.</p>'}</div>`}
 function selectDate(d){selectedDate=d;calendarMonth=d.slice(0,7);render()}
 function shiftMonth(n){const [y,m]=calendarMonth.split('-').map(Number);const d=new Date(y,m-1+n,1);calendarMonth=localISO(d).slice(0,7);render()}
