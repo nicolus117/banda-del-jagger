@@ -77,7 +77,7 @@ async function loadAll(){
 
 }
 async function refresh(){if(!session){data={polls:[],options:[],votes:[],results:[],ideas:[],events:[],links:[]};userArea();nav();await render();return}
- try{const {data:admins,error}=await db.from('admin_users').select('user_id').eq('user_id',session.user.id).maybeSingle();if(error && !/permission/i.test(error.message))console.warn(error);isAdmin=!!admins;await loadAll();userArea();await render()}catch(e){showError(e);userArea();await render()}}
+ try{const {data:admins,error}=await db.from('admin_users').select('user_id').eq('user_id',session.user.id).maybeSingle();if(error)console.error('Error consultando admin_users:',error);isAdmin=!!admins;await loadAll();userArea();await render()}catch(e){showError(e);userArea();await render()}}
 function heading(kicker,title,desc=''){return `<div class="eyebrow">${esc(kicker)}</div><h1>${esc(title)}</h1>${desc?`<p class="muted">${esc(desc)}</p>`:''}`}
 function empty(icon,title,desc,button=''){return `<div class="empty"><div class="big">${icon}</div><b>${esc(title)}</b><p>${esc(desc)}</p>${button}</div>`}
 function delButton(table,id){return isAdmin?`<button class="btn danger" onclick="removeItem('${table}','${id}')">Eliminar</button>`:''}
