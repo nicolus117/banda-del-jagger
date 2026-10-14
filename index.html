@@ -159,7 +159,57 @@ function home(){const now=new Date();const limit=new Date(now);limit.setDate(lim
 return `${heading('El grupo se organiza','¡Aloha!','Un solo lugar para decidir, proponer y organizar los próximos planes.') }<section class="hero"><div class="eyebrow">Banda del Jagger</div><h1>Los mejores planes<br>se arman entre todos.</h1><p>Votá, tirá ideas y organizá las juntadas. Todo queda guardado y compartido.</p><div class="row"><button class="btn" onclick="go('Votaciones')">Ver votaciones</button><button class="btn secondary" onclick="go('Calendario')">Abrir calendario</button></div></section><div class="tiles"><button class="tile" onclick="go('Votaciones')"><span class="ico">☑</span><b>Votaciones</b><small>${data.polls.length} activas</small></button><button class="tile" onclick="go('Propuestas')"><span class="ico">💡</span><b>Propuestas</b><small>${data.ideas.length} ideas de la banda</small></button><button class="tile" onclick="go('Calendario')"><span class="ico">▦</span><b>Calendario</b><small>${data.events.length} eventos</small></button><button class="tile" onclick="go('Enlaces')"><span class="ico">↗</span><b>Enlaces</b><small>${data.links.length} recursos compartidos</small></button></div><div class="section-head"><h2>Próximos planes</h2><button class="btn secondary" onclick="go('Calendario')">Ver todos</button></div>${upcoming.length?upcoming.map(eventCard).join(''):empty('📅','Todavía no hay planes','Creá un evento para que aparezca acá.')}<div class="notice">Conectado a una base de datos compartida. Tus publicaciones quedan visibles para los integrantes que iniciaron sesión.</div>`}
 function pollsPage(){return `${heading('Decisiones grupales','Votaciones','Elegí una opción, marcá varias o completá un ranking.') }<div class="row" style="margin:16px 0 20px"><button class="btn" onclick="go('Crear votación')">＋ Nueva votación</button></div>${data.polls.length?data.polls.map(pollCard).join(''):empty('☑','No hay votaciones todavía','Sé el primero en proponer una decisión.','<button class="btn" onclick="go(\'Crear votación\')">Crear votación</button>')}`}
 function openPoll(id){currentPoll=id;go('Detalle')}
-function pollDetail(){const p=data.polls.find(x=>x.id===currentPoll);if(!p)return `${heading('Votaciones','No se encontró la votación')}<button class="btn secondary" onclick="go('Votaciones')">Volver</button>`;const opts=pollOptions(p.id);const my=data.votes.filter(v=>v.poll_id===p.id&&v.voter_id===session.user.id);const mode=p.poll_type||'simple';return `<button class="back" onclick="go('Votaciones')">← Volver a votaciones</button>${heading(p.anonymous?'Votación anónima':'Votación pública',p.title,p.description||'Tu voto ayuda a decidir.') }<div class="card"><span class="tag">${esc(mode)}</span><div class="options" id="choices">${opts.map((o,i)=>mode==='ranking'?`<label class="option"><span style="flex:1">${esc(o.label)}</span><select class="field rank-choice" data-option="${esc(o.id)}" style="width:95px;padding:7px"><option value="">—</option>${opts.map((_,n)=>`<option value="${n+1}" ${my.find(v=>v.option_id===o.id)?.ranking_position===n+1?'selected':''}>${n+1}°</option>`).join('')}</select></label>`:`<label class="option"><input ${mode==='multiple'?'type="checkbox"':'type="radio"'} name="choice" value="${esc(o.id)}" ${my.some(v=>v.option_id===o.id)?'checked':''}><span>${esc(o.label)}</span></label>`).join('')}</div>${my.length?'<p class="subtle">Ya registraste tu voto. Si votás de nuevo, se reemplazará tu selección.</p>':''}<button class="btn full" onclick="submitVote('${p.id}','${esc(mode)}')">Guardar mi voto</button></div><h2>Resultados</h2>${opts.map(o=>{const summary=data.results.find(v=>v.option_id===o.id);const n=Number(summary?.vote_count||0);const total=Number(summary?.total_selections||0);const pct=total?Math.round(n/total*100):0;return `<div class="card" style="padding:12px 14px"><div class="card-top"><span>${esc(o.label)}</span><b>${n}</b></div><div class="bar"><span style="width:${pct}%"></span></div><small>${pct}% de las selecciones</small></div>`}).join('')}${isAdmin?`<div class="row">${delButton('polls',p.id)}</div>`:''}<div class="notice">Los resultados se muestran de forma agregada. En las votaciones anónimas, la tabla de resultados no expone la identidad de quienes votaron.</div>`}
+
+function pollDetail(){
+  const p=data.polls.find(x=>x.id===currentPoll);
+  if(!p)return `${heading('Votaciones','No se encontró la votación')}<button class="btn secondary" onclick="go('Votaciones')">Volver</button>`;
+
+  const opts=pollOptions(p.id);
+  const my=data.votes.filter(v=>v.poll_id===p.id&&v.voter_id===session.user.id);
+  const mode=p.poll_type||'simple';
+
+  return `<button class="back" onclick="go('Votaciones')">← Volver a votaciones</button>
+  ${heading(p.anonymous?'Votación anónima':'Votación pública',p.title,p.description||'Tu voto ayuda a decidir.')}
+  <div class="card">
+    <span class="tag">${esc(mode)}</span>
+    <div class="options" id="choices">
+      ${opts.map((o,i)=>mode==='ranking'
+        ?`<label class="option"><span style="flex:1">${esc(o.label)}</span><select class="field rank-choice" data-option="${esc(o.id)}" style="width:95px;padding:7px"><option value="">—</option>${opts.map((_,n)=>`<option value="${n+1}" ${my.find(v=>v.option_id===o.id)?.ranking_position===n+1?'selected':''}>${n+1}°</option>`).join('')}</select></label>`
+        :`<label class="option"><input ${mode==='multiple'?'type="checkbox"':'type="radio"'} name="choice" value="${esc(o.id)}" ${my.some(v=>v.option_id===o.id)?'checked':''}><span>${esc(o.label)}</span></label>`
+      ).join('')}
+    </div>
+    ${my.length?'<p class="subtle">Ya registraste tu voto. Si votás de nuevo, se reemplazará tu selección.</p>':''}
+    <button class="btn full" onclick="submitVote('${p.id}','${esc(mode)}')">Guardar mi voto</button>
+  </div>
+
+  <h2>Resultados</h2>
+  ${opts.map(o=>{
+    const summary=data.results.find(v=>v.option_id===o.id);
+    const n=Number(summary?.vote_count||0);
+    const total=Number(summary?.total_selections||0);
+    const pct=total?Math.round(n/total*100):0;
+
+    const names=p.anonymous?[]:data.publicVoteNames
+      .filter(v=>v.poll_id===p.id&&v.option_id===o.id)
+      .map(v=>v.voter_name);
+
+    return `<div class="card" style="padding:12px 14px">
+      <div class="card-top"><span>${esc(o.label)}</span><b>${n} ${n===1?'voto':'votos'}</b></div>
+      <div class="bar"><span style="width:${pct}%"></span></div>
+      <small>${pct}% de las selecciones</small>
+      ${!p.anonymous&&names.length
+        ?`<p class="subtle" style="margin:8px 0 0">Votaron: ${names.map(name=>esc(name)).join(', ')}</p>`
+        :''}
+    </div>`;
+  }).join('')}
+
+  ${isAdmin?`<div class="row">${delButton('polls',p.id)}</div>`:''}
+  <div class="notice">${p.anonymous
+    ?'Esta votación es anónima: se muestran únicamente las cantidades, sin identificar a quienes votaron.'
+    :'Esta votación es pública: se muestran los nombres asociados a cada opción.'}
+  </div>`;
+}
+
 async function submitVote(pollId,mode){const p=data.polls.find(x=>x.id===pollId);if(!p)return;let selected=[],positions={};if(mode==='ranking'){const picks=[...document.querySelectorAll('#choices .rank-choice')].map(x=>({id:x.dataset.option,pos:x.value?Number(x.value):null})).filter(x=>x.pos!==null);const seen=new Set(picks.map(x=>x.pos));if(picks.length<2)return toast('Ordená al menos dos opciones.');if(seen.size!==picks.length)return toast('No repitas posiciones en el ranking.');picks.sort((a,b)=>a.pos-b.pos);selected=picks.map(x=>x.id);positions=Object.fromEntries(picks.map(x=>[x.id,x.pos]));}else{selected=[...document.querySelectorAll('#choices input:checked')].map(x=>x.value);if(mode==='simple'&&selected.length>1)selected=selected.slice(0,1)}if(!selected.length)return toast('Elegí al menos una opción.');try{const rows=selected.map(option_id=>({option_id,ranking_position:mode==='ranking'?positions[option_id]:null}));const {error}=await db.rpc('cast_vote',{p_poll_id:pollId,p_votes:rows});if(error)throw error;toast('¡Voto registrado!');await refresh()}catch(e){showError(e)}}
 function createPoll(){return `<button class="back" onclick="go('Votaciones')">← Volver</button>${heading('Nueva decisión','Crear votación','La pregunta y las opciones quedarán compartidas con toda la banda.')}<form onsubmit="savePoll(event)" class="card"><div class="formrow"><label for="ptitle">Pregunta</label><input class="field" id="ptitle" maxlength="140" required placeholder="Ej.: ¿Qué hacemos este finde?"></div><div class="formrow"><label for="pdesc">Descripción (opcional)</label><textarea class="field" id="pdesc" maxlength="500" placeholder="Agregá contexto o detalles…"></textarea></div><div class="formrow"><label for="pmode">Tipo de votación</label><select class="field" id="pmode"><option value="simple">Voto simple (una opción)</option><option value="multiple">Voto múltiple (varias opciones)</option><option value="ranking">Ranking (orden de preferencia)</option></select></div><div class="formrow"><label for="poptions">Opciones (una por línea, mínimo 2)</label><textarea class="field" id="poptions" required placeholder="Fútbol 5&#10;Pizza y birra&#10;Asado en el parque"></textarea></div><div class="formrow"><label for="pprivacy">Privacidad de resultados</label><select class="field" id="pprivacy"><option value="false">Pública</option><option value="true">Anónima (sin identidades visibles para el grupo)</option></select></div><button class="btn full">Publicar votación</button></form>`}
 async function savePoll(e){e.preventDefault();const title=$('ptitle').value.trim(),description=$('pdesc').value.trim(),poll_type=$('pmode').value,anonymous=$('pprivacy').value==='true';const labels=$('poptions').value.split('\n').map(s=>s.trim()).filter(Boolean);if(labels.length<2)return toast('Agregá al menos dos opciones.');if(labels.length>30)return toast('Usá como máximo 30 opciones.');try{const {error}=await db.rpc('create_poll',{p_title:title,p_description:description||null,p_poll_type:poll_type,p_anonymous:anonymous,p_options:labels});if(error)throw error;toast('¡Votación publicada!');await refresh();page='Votaciones';await render()}catch(e){showError(e)}}
