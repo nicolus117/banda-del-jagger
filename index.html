@@ -98,7 +98,7 @@ const SUPABASE_ANON_KEY = 'sb_publishable_SwTp5a9Q2xCSJiccZRCqpg_rf8bl289';
 const CONFIGURED = SUPABASE_ANON_KEY !== 'PEGAR_AQUI_TU_PUBLISHABLE_KEY' && SUPABASE_ANON_KEY.trim().length > 20;
 const navs=[['Inicio','⌂'],['Votaciones','☑'],['Propuestas','♧'],['Calendario','▦'],['Enlaces','↗']];
 let db=null, session=null, profile=null, isAdmin=false, page='Inicio', currentPoll=null, selectedDate='', calendarMonth='', toastTimer=null;
-let data={polls:[],options:[],votes:[],results:[],ideas:[],events:[],links:[]};
+let data={polls:[],options:[],votes:[],results:[],publicVoteNames:[],ideas:[],events:[],links:[]};
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtDate=s=>s?new Date(s+'T12:00:00').toLocaleDateString('es-AR',{day:'numeric',month:'short'}):'';
@@ -113,31 +113,38 @@ function userArea(){if(!session){$('userArea').innerHTML='';return}const name=pr
 async function go(p){page=p;nav();await render()}
 async function signIn(){if(!db)return toast('Primero configurá la clave pública de Supabase en el archivo.');const {error}=await db.auth.signInWithOAuth({provider:'google',options:{redirectTo:location.href.split('#')[0]}});if(error)showError(error)}
 async function signOut(){if(db){const {error}=await db.auth.signOut();if(error)showError(error)}}
-async function loadAll(){
- const tasks=[
-  ['polls','polls',true],['options','poll_options',false],
-  ['ideas','proposals',true],['events','calendar_events',true],['links','shared_links',true]
- ];
- const results=await Promise.all(tasks.map(async ([key,table,hasCreatedAt])=>{let q=db.from(table).select('*');if(hasCreatedAt)q=q.order('created_at',{ascending:false});const {data,error}=await q.limit(500);if(error)throw error;return [key,data||[]]}));
- results.forEach(([k,v])=>data[k]=v);
 
- // Los resultados se consultan mediante una función segura que devuelve solo agregados.
- const [summaryGroups, ownResult] = await Promise.all([
-  Promise.all(data.polls.map(async poll => {
-   const {data: rows, error} = await db.rpc('get_vote_results', {
-    p_poll_id: poll.id
-   });
-   if (error) throw error;
-   return rows || [];
-  })),
-  db.from('votes')
-   .select('id,poll_id,option_id,voter_id,ranking_position,created_at')
-   .eq('voter_id', session.user.id)
-   .limit(500)
- ]);
- if (ownResult.error) throw ownResult.error;
- data.results = summaryGroups.flat();
- data.votes = ownResult.data || [];
+  const [summaryGroups, ownResult, publicNameGroups] = await Promise.all([
+    Promise.all(data.polls.map(async poll => {
+      const {data: rows, error} = await db.rpc('get_vote_results', {
+        p_poll_id: poll.id
+      });
+      if (error) throw error;
+      return rows || [];
+    })),
+    db.from('votes')
+      .select('id,poll_id,option_id,voter_id,ranking_position,created_at')
+      .eq('voter_id', session.user.id)
+      .limit(500),
+    Promise.all(data.polls
+      .filter(poll => !poll.anonymous)
+      .map(async poll => {
+        const {data: rows, error} = await db.rpc(
+          'get_public_vote_names',
+          {p_poll_id: poll.id}
+        );
+        if (error) throw error;
+        return (rows || []).map(row => ({
+          ...row,
+          poll_id: poll.id
+        }));
+      }))
+  ]);
+
+  if (ownResult.error) throw ownResult.error;
+  data.results = summaryGroups.flat();
+  data.votes = ownResult.data || [];
+  data.publicVoteNames = publicNameGroups.flat();
 
 }
 async function refresh(){if(!session){data={polls:[],options:[],votes:[],results:[],ideas:[],events:[],links:[]};userArea();nav();await render();return}
