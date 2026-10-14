@@ -107,45 +107,113 @@ const localISO=d=>{const x=new Date(d);return `${x.getFullYear()}-${String(x.get
 
 function toast(msg){const t=$('toast');t.textContent=msg;t.classList.remove('hide');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.add('hide'),3000)}
 function friendlyError(e){const m=e?.message||String(e||'Ocurrió un error');console.error(e);if(/row-level security|permission denied/i.test(m))return 'La base de datos bloqueó esta acción por permisos. Revisá que el SQL de configuración esté aplicado.';if(/duplicate key|unique constraint/i.test(m))return 'Ya existe un registro equivalente o ya votaste en esta opción.';return m}
-function showError(e){toast(friendlyError(e))}
-function nav(){ $('bottom').innerHTML=navs.map(([n,i])=>`<button class="navitem ${page===n?'active':''}" onclick="go('${n}')"><span class="ico">${i}</span><span>${n}</span></button>`).join('') }
-function userArea(){if(!session){$('userArea').innerHTML='';return}const name=profile?.full_name||session.user.user_metadata?.full_name||session.user.email||'Integrante';const pic=profile?.avatar_url||session.user.user_metadata?.avatar_url;$('userArea').innerHTML=`${pic?`<img class="avatar" src="${esc(pic)}" alt="">`:`<div class="avatar" style="display:grid;place-items:center">👤</div>`}<span class="subtle">${esc(name.split(' ')[0])}${isAdmin?' · Admin':''}</span><button class="pillbtn" onclick="signOut()">Salir</button>`}
-async function go(p){page=p;nav();await render()}
-async function signIn(){if(!db)return toast('Primero configurá la clave pública de Supabase en el archivo.');const {error}=await db.auth.signInWithOAuth({provider:'google',options:{redirectTo:location.href.split('#')[0]}});if(error)showError(error)}
-async function signOut(){if(db){const {error}=await db.auth.signOut();if(error)showError(error)}}
 
-  const [summaryGroups, ownResult, publicNameGroups] = await Promise.all([
+async function loadAll() {
+  if (!session) {
+    data = {
+      polls: [],
+      options: [],
+      votes: [],
+      results: [],
+      publicVoteNames: [],
+      ideas: [],
+      events: [],
+      links: []
+    };
+    return;
+  }
+
+  // Cargar las votaciones, opciones, propuestas, eventos y enlaces.
+  const [
+    pollsResult,
+    optionsResult,
+    ideasResult,
+    eventsResult,
+    linksResult
+  ] = await Promise.all([
+    db.from('polls')
+      .select('*')
+      .order('created_at', { ascending: false }),
+
+    db.from('poll_options')
+      .select('*'),
+
+    db.from('proposals')
+      .select('*')
+      .order('created_at', { ascending: false }),
+
+    db.from('calendar_events')
+      .select('*')
+      .order('starts_at', { ascending: true }),
+
+    db.from('shared_links')
+      .select('*')
+      .order('created_at', { ascending: false })
+  ]);
+
+  if (pollsResult.error) throw pollsResult.error;
+  if (optionsResult.error) throw optionsResult.error;
+  if (ideasResult.error) throw ideasResult.error;
+  if (eventsResult.error) throw eventsResult.error;
+  if (linksResult.error) throw linksResult.error;
+
+  data.polls = pollsResult.data || [];
+  data.options = optionsResult.data || [];
+  data.ideas = ideasResult.data || [];
+  data.events = eventsResult.data || [];
+  data.links = linksResult.data || [];
+
+  // Cargar los resultados y los votos del usuario.
+  const [
+    summaryGroups,
+    ownResult,
+    publicNameGroups
+  ] = await Promise.all([
     Promise.all(data.polls.map(async poll => {
-      const {data: rows, error} = await db.rpc('get_vote_results', {
-        p_poll_id: poll.id
-      });
+      const { data: rows, error } = await db.rpc(
+        'get_vote_results',
+        { p_poll_id: poll.id }
+      );
+
       if (error) throw error;
-      return rows || [];
+
+      return (rows || []).map(row => ({
+        ...row,
+        poll_id: poll.id
+      }));
     })),
+
     db.from('votes')
-      .select('id,poll_id,option_id,voter_id,ranking_position,created_at')
+      .select(
+        'id,poll_id,option_id,voter_id,ranking_position,created_at'
+      )
       .eq('voter_id', session.user.id)
       .limit(500),
-    Promise.all(data.polls
-      .filter(poll => !poll.anonymous)
-      .map(async poll => {
-        const {data: rows, error} = await db.rpc(
-          'get_public_vote_names',
-          {p_poll_id: poll.id}
-        );
-        if (error) throw error;
-        return (rows || []).map(row => ({
-          ...row,
-          poll_id: poll.id
-        }));
-      }))
+
+    Promise.all(
+      data.polls
+        .filter(poll => !poll.anonymous)
+        .map(async poll => {
+          const { data: rows, error } = await db.rpc(
+            'get_public_vote_names',
+            { p_poll_id: poll.id }
+          );
+
+          if (error) throw error;
+
+          return (rows || []).map(row => ({
+            ...row,
+            poll_id: poll.id
+          }));
+        })
+    )
   ]);
 
   if (ownResult.error) throw ownResult.error;
+
   data.results = summaryGroups.flat();
   data.votes = ownResult.data || [];
   data.publicVoteNames = publicNameGroups.flat();
-
 }
 async function refresh(){if(!session){data={polls:[],options:[],votes:[],results:[],ideas:[],events:[],links:[]};userArea();nav();await render();return}
  try{const {data:admins,error}=await db.from('admin_users').select('user_id').eq('user_id',session.user.id).maybeSingle();if(error)console.error('Error consultando admin_users:',error);isAdmin=!!admins;await loadAll();userArea();await render()}catch(e){showError(e);userArea();await render()}}
