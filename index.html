@@ -55,13 +55,25 @@ async function loadAll(){
  ];
  const results=await Promise.all(tasks.map(async ([key,table,hasCreatedAt])=>{let q=db.from(table).select('*');if(hasCreatedAt)q=q.order('created_at',{ascending:false});const {data,error}=await q.limit(500);if(error)throw error;return [key,data||[]]}));
  results.forEach(([k,v])=>data[k]=v);
- // Los resultados públicos vienen agregados, sin identidades. De la tabla votes solo se leen los votos propios.
- const [{data:summary,error:summaryError},{data:ownVotes,error:ownError}]=await Promise.all([
-  db.from('vote_results').select('*').limit(2000),
-  db.from('votes').select('id,poll_id,option_id,voter_id,ranking_position,created_at').eq('voter_id',session.user.id).limit(500)
+
+ // Los resultados se consultan mediante una función segura que devuelve solo agregados.
+ const [summaryGroups, ownResult] = await Promise.all([
+  Promise.all(data.polls.map(async poll => {
+   const {data: rows, error} = await db.rpc('get_vote_results', {
+    p_poll_id: poll.id
+   });
+   if (error) throw error;
+   return rows || [];
+  })),
+  db.from('votes')
+   .select('id,poll_id,option_id,voter_id,ranking_position,created_at')
+   .eq('voter_id', session.user.id)
+   .limit(500)
  ]);
- if(summaryError)throw summaryError;if(ownError)throw ownError;
- data.results=summary||[];data.votes=ownVotes||[];
+ if (ownResult.error) throw ownResult.error;
+ data.results = summaryGroups.flat();
+ data.votes = ownResult.data || [];
+
 }
 async function refresh(){if(!session){data={polls:[],options:[],votes:[],results:[],ideas:[],events:[],links:[]};userArea();nav();await render();return}
  try{const {data:admins,error}=await db.from('admin_users').select('user_id').eq('user_id',session.user.id).maybeSingle();if(error && !/permission/i.test(error.message))console.warn(error);isAdmin=!!admins;await loadAll();userArea();await render()}catch(e){showError(e);userArea();await render()}}
