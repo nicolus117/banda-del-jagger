@@ -44,6 +44,10 @@ create table if not exists public.wheel_spins (
 
 alter table public.wheel_spins enable row level security;
 
+-- Permiso para que la página pueda leer el historial (las reglas de abajo
+-- deciden qué filas).
+grant select, delete on public.wheel_spins to authenticated;
+
 -- Toda la banda puede ver el historial.
 drop policy if exists "Ver historial de la ruleta" on public.wheel_spins;
 create policy "Ver historial de la ruleta" on public.wheel_spins
