@@ -1,0 +1,16 @@
+{
+  "name": "Banda del Jagger",
+  "short_name": "Jagger",
+  "description": "Votaciones, propuestas, calendario y herramientas de la Banda del Jagger.",
+  "lang": "es-AR",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0d0d15",
+  "theme_color": "#10101a",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
