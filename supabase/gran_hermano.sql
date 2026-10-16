@@ -10,6 +10,10 @@
 --     cruzar quién votó a quién.
 --   * Nadie lee estas tablas directo; los resultados solo salen de gh_state()
 --     cuando la votación ya cerró.
+--   * Excepción acordada con la banda: en las votaciones creadas desde esta
+--     versión (admin_sees = true), el admin puede ver quién votó a quién, y
+--     solo cuando la votación ya cerró. La página lo avisa al votar. Las
+--     votaciones anteriores siguen siendo secretas para todos.
 --
 -- Horarios (hora de Argentina):
 --   * Se abre sola cada jueves a las 22:00 y se cierra el viernes a las 23:59.
@@ -83,6 +87,28 @@ on conflict (week) do nothing;
 alter table public.gh_past enable row level security;
 revoke all on public.gh_past from anon, authenticated;
 
+-- ¿El admin puede ver quién votó a quién en esta votación? (las viejas, no)
+alter table public.gh_rounds add column if not exists admin_sees boolean not null default false;
+
+-- Registro de votos que ve solo el admin (solo para votaciones con admin_sees).
+create table if not exists public.gh_admin_log (
+  round_id uuid not null references public.gh_rounds (id) on delete cascade,
+  voter uuid not null references auth.users (id) on delete cascade,
+  target uuid not null,
+  primary key (round_id, voter)
+);
+alter table public.gh_admin_log enable row level security;
+revoke all on public.gh_admin_log from anon, authenticated;
+
+-- Gente sin cuenta que el admin suma a mano: se la puede votar, pero no vota.
+create table if not exists public.gh_guests (
+  id uuid primary key default gen_random_uuid(),
+  name text not null check (char_length(name) between 1 and 40),
+  created_at timestamptz not null default now()
+);
+alter table public.gh_guests enable row level security;
+revoke all on public.gh_guests from anon, authenticated;
+
 alter table public.gh_rounds enable row level security;
 alter table public.gh_settings enable row level security;
 revoke all on public.gh_settings from anon, authenticated;
@@ -127,9 +153,9 @@ as $$
 declare
   v_id uuid;
 begin
-  insert into public.gh_rounds (kind, week_date, parent_id, opens_at, closes_at, candidates, voters, eligible)
+  insert into public.gh_rounds (kind, week_date, parent_id, opens_at, closes_at, candidates, voters, eligible, admin_sees)
   values (p_kind, p_week, p_parent, p_opens, p_closes, p_candidates, p_voters,
-          coalesce(array_length(p_voters, 1), (select count(*) from auth.users)::int))
+          coalesce(array_length(p_voters, 1), (select count(*) from auth.users)::int), true)
   returning id into v_id;
 
   insert into public.gh_tally (round_id, target)
@@ -140,6 +166,24 @@ end;
 $$;
 
 -- Nominados (participantes) y votantes según la casa (solo usuarios que existen).
+-- Todas las personas del juego: integrantes con cuenta y gente sumada a mano.
+create or replace function public.gh_people()
+returns table (id uuid, name text, avatar_url text, guest boolean)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select u.id,
+         coalesce(u.raw_user_meta_data ->> 'full_name', u.raw_user_meta_data ->> 'name', split_part(u.email, '@', 1), 'Integrante')::text,
+         (u.raw_user_meta_data ->> 'avatar_url')::text,
+         false
+  from auth.users u
+  union all
+  select g.id, g.name, null::text, true from public.gh_guests g;
+$$;
+revoke all on function public.gh_people() from public, anon, authenticated;
+
 -- Si todavía no se cargó la casa, se puede votar a todos.
 create or replace function public.gh_cfg_nominees()
 returns uuid[]
@@ -150,8 +194,8 @@ set search_path = public
 as $$
   select case when (select statuses from public.gh_settings where id = 1) = '{}'::jsonb
     then (select array_agg(id) from auth.users)
-    else (select array_agg(u.id) from auth.users u, public.gh_settings s
-          where s.id = 1 and s.statuses ->> u.id::text = 'participante')
+    else (select array_agg(p.id) from public.gh_people() p, public.gh_settings s
+          where s.id = 1 and s.statuses ->> p.id::text = 'participante')
   end;
 $$;
 
@@ -261,14 +305,15 @@ begin
     -- La casa: visible para todos.
     'house', (
       select coalesce(jsonb_agg(jsonb_build_object(
-        'id', u.id,
-        'name', coalesce(u.raw_user_meta_data ->> 'full_name', u.raw_user_meta_data ->> 'name', split_part(u.email, '@', 1), 'Integrante'),
-        'avatar_url', u.raw_user_meta_data ->> 'avatar_url',
-        'status', s.statuses ->> u.id::text
-      ) order by coalesce(u.raw_user_meta_data ->> 'full_name', u.email)), '[]'::jsonb)
-      from auth.users u, public.gh_settings s
-      where s.id = 1 and s.statuses ? u.id::text
+        'id', p.id, 'name', p.name, 'avatar_url', p.avatar_url, 'guest', p.guest,
+        'status', s.statuses ->> p.id::text
+      ) order by lower(p.name)), '[]'::jsonb)
+      from public.gh_people() p, public.gh_settings s
+      where s.id = 1 and s.statuses ? p.id::text
     ),
+    -- Gente sumada a mano (para el panel del admin).
+    'guests', (select coalesce(jsonb_agg(jsonb_build_object('id', g.id, 'name', g.name) order by lower(g.name)), '[]'::jsonb)
+               from public.gh_guests g),
     'rounds', coalesce((
     select jsonb_agg(x.j order by x.created_at desc)
     from (
@@ -283,13 +328,12 @@ begin
         'voters_count', (select count(*) from public.gh_voted v where v.round_id = r.id),
         'i_voted', exists (select 1 from public.gh_voted v where v.round_id = r.id and v.user_id = v_me),
         'can_vote', (r.voters is null or v_me = any (r.voters)),
+        'admin_sees', r.admin_sees,
         'candidates', (
           select coalesce(jsonb_agg(jsonb_build_object(
-            'id', u.id,
-            'name', coalesce(u.raw_user_meta_data ->> 'full_name', u.raw_user_meta_data ->> 'name', split_part(u.email, '@', 1), 'Integrante'),
-            'avatar_url', u.raw_user_meta_data ->> 'avatar_url'
-          ) order by coalesce(u.raw_user_meta_data ->> 'full_name', u.email)), '[]'::jsonb)
-          from auth.users u where u.id = any (r.candidates)
+            'id', p.id, 'name', p.name, 'avatar_url', p.avatar_url
+          ) order by lower(p.name)), '[]'::jsonb)
+          from public.gh_people() p where p.id = any (r.candidates)
         ),
         -- Los votos solo salen cuando la votación ya cerró.
         'results', case when r.closed_at is not null or r.closes_at <= now() then (
@@ -347,6 +391,44 @@ begin
   update public.gh_voted
      set touch = touch + 1
    where round_id = p_round_id;
+
+  -- Solo en las votaciones donde se avisó que el admin lo puede ver.
+  if r.admin_sees then
+    insert into public.gh_admin_log (round_id, voter, target) values (p_round_id, auth.uid(), p_target);
+  end if;
+end;
+$$;
+
+-- Historial de quién votó a quién: solo admin, solo votaciones cerradas con admin_sees.
+create or replace function public.gh_admin_votes()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  if not public.gh_is_admin() then
+    raise exception 'Solo el admin puede ver el historial de votos.';
+  end if;
+
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'round_id', r.id,
+      'votes', (
+        select coalesce(jsonb_agg(jsonb_build_object(
+          'voter', coalesce(v.raw_user_meta_data ->> 'full_name', v.raw_user_meta_data ->> 'name', split_part(v.email, '@', 1)),
+          'target', coalesce(t.name, 'Alguien que ya no está')
+        ) order by coalesce(v.raw_user_meta_data ->> 'full_name', v.email)), '[]'::jsonb)
+        from public.gh_admin_log l
+        join auth.users v on v.id = l.voter
+        left join public.gh_people() t on t.id = l.target
+        where l.round_id = r.id
+      )
+    ) order by r.created_at desc)
+    from public.gh_rounds r
+    where r.admin_sees and (r.closed_at is not null or r.closes_at <= now())
+  ), '[]'::jsonb);
 end;
 $$;
 
@@ -438,7 +520,7 @@ begin
   select coalesce(jsonb_object_agg(e.key, e.value), '{}'::jsonb) into v_clean
   from jsonb_each(coalesce(p_statuses, '{}'::jsonb)) e
   where e.value #>> '{}' in ('participante', 'inmune', 'eliminado')
-    and exists (select 1 from auth.users u where u.id::text = e.key);
+    and exists (select 1 from public.gh_people() p where p.id::text = e.key);
 
   if (select count(*) from jsonb_each(v_clean) e where e.value #>> '{}' = 'participante') < 2 then
     raise exception 'Tiene que haber al menos 2 participantes.';
@@ -512,6 +594,46 @@ begin
 end;
 $$;
 
+-- Sumar o quitar gente sin cuenta (solo admin).
+create or replace function public.gh_guest_add(p_name text)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_id uuid;
+  v_name text := left(btrim(coalesce(p_name, '')), 40);
+begin
+  if not public.gh_is_admin() then
+    raise exception 'Solo el admin puede sumar gente.';
+  end if;
+  if v_name = '' then
+    raise exception 'Escribí un nombre.';
+  end if;
+  if exists (select 1 from public.gh_people() p where lower(p.name) = lower(v_name)) then
+    raise exception 'Ya hay alguien con ese nombre.';
+  end if;
+  insert into public.gh_guests (name) values (v_name) returning id into v_id;
+  return v_id;
+end;
+$$;
+
+create or replace function public.gh_guest_delete(p_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.gh_is_admin() then
+    raise exception 'Solo el admin puede quitar gente.';
+  end if;
+  delete from public.gh_guests where id = p_id;
+  update public.gh_settings set statuses = statuses - p_id::text where id = 1;
+end;
+$$;
+
 -- ---------- Permisos ----------
 revoke all on function public.gh_state() from public, anon;
 revoke all on function public.gh_vote(uuid, uuid) from public, anon;
@@ -522,6 +644,9 @@ revoke all on function public.gh_apply_nominees(uuid) from public, anon;
 revoke all on function public.gh_set_statuses(jsonb, boolean) from public, anon;
 revoke all on function public.gh_past_save(int, text) from public, anon;
 revoke all on function public.gh_past_delete(uuid) from public, anon;
+revoke all on function public.gh_admin_votes() from public, anon;
+revoke all on function public.gh_guest_add(text) from public, anon;
+revoke all on function public.gh_guest_delete(uuid) from public, anon;
 
 grant execute on function public.gh_state() to authenticated;
 grant execute on function public.gh_vote(uuid, uuid) to authenticated;
@@ -532,3 +657,6 @@ grant execute on function public.gh_apply_nominees(uuid) to authenticated;
 grant execute on function public.gh_set_statuses(jsonb, boolean) to authenticated;
 grant execute on function public.gh_past_save(int, text) to authenticated;
 grant execute on function public.gh_past_delete(uuid) to authenticated;
+grant execute on function public.gh_admin_votes() to authenticated;
+grant execute on function public.gh_guest_add(text) to authenticated;
+grant execute on function public.gh_guest_delete(uuid) to authenticated;
