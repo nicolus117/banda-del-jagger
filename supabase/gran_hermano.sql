@@ -17,8 +17,10 @@
 --   * Si hay empate, se abre un desempate de 24 horas entre los empatados.
 --     Si vuelve a empatar, otro desempate.
 --
--- Nominados: el admin elige quiénes se pueden votar (y si votan todos o solo
--- los nominados). Esa lista se usa en cada votación automática.
+-- La casa: el admin marca a cada integrante como participante (se lo puede
+-- votar), inmune, eliminado o fuera del juego. Los participantes son los
+-- nominados de cada votación automática. Al cerrar una votación sin empate,
+-- el más votado pasa solo a eliminado.
 
 -- ---------- Tablas ----------
 create table if not exists public.gh_rounds (
@@ -59,6 +61,15 @@ create table if not exists public.gh_settings (
   only_nominees_vote boolean not null default false
 );
 insert into public.gh_settings (id) values (1) on conflict (id) do nothing;
+
+-- Estado de cada integrante: {"<id>": "participante" | "inmune" | "eliminado"}.
+-- Quien no figura, no juega.
+alter table public.gh_settings add column if not exists statuses jsonb not null default '{}'::jsonb;
+
+-- Si ya había nominados guardados, pasan a ser participantes.
+update public.gh_settings
+   set statuses = (select coalesce(jsonb_object_agg(x::text, 'participante'), '{}'::jsonb) from unnest(nominees) as x)
+ where id = 1 and statuses = '{}'::jsonb and nominees is not null;
 
 alter table public.gh_rounds enable row level security;
 alter table public.gh_settings enable row level security;
@@ -116,7 +127,8 @@ begin
 end;
 $$;
 
--- Nominados y votantes según la configuración del admin (solo usuarios que existen).
+-- Nominados (participantes) y votantes según la casa (solo usuarios que existen).
+-- Si todavía no se cargó la casa, se puede votar a todos.
 create or replace function public.gh_cfg_nominees()
 returns uuid[]
 language sql
@@ -124,13 +136,14 @@ stable
 security definer
 set search_path = public
 as $$
-  select coalesce(
-    (select array_agg(u.id) from auth.users u, public.gh_settings s
-     where s.id = 1 and u.id = any (s.nominees)),
-    (select array_agg(id) from auth.users)
-  );
+  select case when (select statuses from public.gh_settings where id = 1) = '{}'::jsonb
+    then (select array_agg(id) from auth.users)
+    else (select array_agg(u.id) from auth.users u, public.gh_settings s
+          where s.id = 1 and s.statuses ->> u.id::text = 'participante')
+  end;
 $$;
 
+-- Votan todos los registrados, o solo los que juegan (participantes, inmunes y eliminados).
 create or replace function public.gh_cfg_voters()
 returns uuid[]
 language sql
@@ -139,7 +152,10 @@ security definer
 set search_path = public
 as $$
   select case when (select only_nominees_vote from public.gh_settings where id = 1)
-              then public.gh_cfg_nominees() end;
+                   and (select statuses from public.gh_settings where id = 1) <> '{}'::jsonb
+              then (select array_agg(u.id) from auth.users u, public.gh_settings s
+                    where s.id = 1 and s.statuses ? u.id::text)
+         end;
 $$;
 
 -- Abre la votación de la semana y los desempates que hagan falta.
@@ -189,6 +205,11 @@ begin
         v_end := now() + interval '24 hours';
       end if;
       perform public.gh_new_round('desempate', r.week_date, r.id, now(), v_end, v_tied, r.voters);
+    elsif coalesce(v_max, 0) > 0 then
+      -- Ganó uno solo: pasa a eliminado (si era participante).
+      update public.gh_settings
+         set statuses = jsonb_set(statuses, array[v_tied[1]::text], '"eliminado"')
+       where id = 1 and statuses ->> v_tied[1]::text = 'participante';
     end if;
 
     update public.gh_rounds set tie_handled = true where id = r.id;
@@ -220,8 +241,19 @@ begin
 
   return jsonb_build_object(
     'settings', jsonb_build_object(
-      'nominees', (select to_jsonb(nominees) from public.gh_settings where id = 1),
+      'statuses', (select statuses from public.gh_settings where id = 1),
       'only_nominees_vote', (select only_nominees_vote from public.gh_settings where id = 1)
+    ),
+    -- La casa: visible para todos.
+    'house', (
+      select coalesce(jsonb_agg(jsonb_build_object(
+        'id', u.id,
+        'name', coalesce(u.raw_user_meta_data ->> 'full_name', u.raw_user_meta_data ->> 'name', split_part(u.email, '@', 1), 'Integrante'),
+        'avatar_url', u.raw_user_meta_data ->> 'avatar_url',
+        'status', s.statuses ->> u.id::text
+      ) order by coalesce(u.raw_user_meta_data ->> 'full_name', u.email)), '[]'::jsonb)
+      from auth.users u, public.gh_settings s
+      where s.id = 1 and s.statuses ? u.id::text
     ),
     'rounds', coalesce((
     select jsonb_agg(x.j order by x.created_at desc)
@@ -284,7 +316,7 @@ begin
     raise exception 'Esa persona no está en esta votación.';
   end if;
   if r.voters is not null and not (auth.uid() = any (r.voters)) then
-    raise exception 'En esta votación votan solo los nominados.';
+    raise exception 'En esta votación votan solo los que juegan.';
   end if;
 
   begin
@@ -375,6 +407,35 @@ begin
 end;
 $$;
 
+-- Guarda el estado de cada integrante en la casa.
+create or replace function public.gh_set_statuses(p_statuses jsonb, p_only_players_vote boolean)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_clean jsonb;
+begin
+  if not public.gh_is_admin() then
+    raise exception 'Solo el admin puede cambiar la casa.';
+  end if;
+
+  select coalesce(jsonb_object_agg(e.key, e.value), '{}'::jsonb) into v_clean
+  from jsonb_each(coalesce(p_statuses, '{}'::jsonb)) e
+  where e.value #>> '{}' in ('participante', 'inmune', 'eliminado')
+    and exists (select 1 from auth.users u where u.id::text = e.key);
+
+  if (select count(*) from jsonb_each(v_clean) e where e.value #>> '{}' = 'participante') < 2 then
+    raise exception 'Tiene que haber al menos 2 participantes.';
+  end if;
+
+  update public.gh_settings
+     set statuses = v_clean, only_nominees_vote = coalesce(p_only_players_vote, false)
+   where id = 1;
+end;
+$$;
+
 -- Aplica la lista de nominados a una votación abierta en la que todavía nadie votó.
 create or replace function public.gh_apply_nominees(p_round_id uuid)
 returns void
@@ -414,6 +475,7 @@ revoke all on function public.gh_open_now() from public, anon;
 revoke all on function public.gh_close_now(uuid) from public, anon;
 revoke all on function public.gh_set_nominees(uuid[], boolean) from public, anon;
 revoke all on function public.gh_apply_nominees(uuid) from public, anon;
+revoke all on function public.gh_set_statuses(jsonb, boolean) from public, anon;
 
 grant execute on function public.gh_state() to authenticated;
 grant execute on function public.gh_vote(uuid, uuid) to authenticated;
@@ -421,3 +483,4 @@ grant execute on function public.gh_open_now() to authenticated;
 grant execute on function public.gh_close_now(uuid) to authenticated;
 grant execute on function public.gh_set_nominees(uuid[], boolean) to authenticated;
 grant execute on function public.gh_apply_nominees(uuid) to authenticated;
+grant execute on function public.gh_set_statuses(jsonb, boolean) to authenticated;
