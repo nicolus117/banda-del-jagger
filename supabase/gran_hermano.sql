@@ -10,6 +10,10 @@
 --     cruzar quién votó a quién.
 --   * Nadie lee estas tablas directo; los resultados solo salen de gh_state()
 --     cuando la votación ya cerró.
+--   * Excepción acordada con la banda: en las votaciones creadas desde esta
+--     versión (admin_sees = true), el admin puede ver quién votó a quién, y
+--     solo cuando la votación ya cerró. La página lo avisa al votar. Las
+--     votaciones anteriores siguen siendo secretas para todos.
 --
 -- Horarios (hora de Argentina):
 --   * Se abre sola cada jueves a las 22:00 y se cierra el viernes a las 23:59.
@@ -83,6 +87,19 @@ on conflict (week) do nothing;
 alter table public.gh_past enable row level security;
 revoke all on public.gh_past from anon, authenticated;
 
+-- ¿El admin puede ver quién votó a quién en esta votación? (las viejas, no)
+alter table public.gh_rounds add column if not exists admin_sees boolean not null default false;
+
+-- Registro de votos que ve solo el admin (solo para votaciones con admin_sees).
+create table if not exists public.gh_admin_log (
+  round_id uuid not null references public.gh_rounds (id) on delete cascade,
+  voter uuid not null references auth.users (id) on delete cascade,
+  target uuid not null,
+  primary key (round_id, voter)
+);
+alter table public.gh_admin_log enable row level security;
+revoke all on public.gh_admin_log from anon, authenticated;
+
 alter table public.gh_rounds enable row level security;
 alter table public.gh_settings enable row level security;
 revoke all on public.gh_settings from anon, authenticated;
@@ -127,9 +144,9 @@ as $$
 declare
   v_id uuid;
 begin
-  insert into public.gh_rounds (kind, week_date, parent_id, opens_at, closes_at, candidates, voters, eligible)
+  insert into public.gh_rounds (kind, week_date, parent_id, opens_at, closes_at, candidates, voters, eligible, admin_sees)
   values (p_kind, p_week, p_parent, p_opens, p_closes, p_candidates, p_voters,
-          coalesce(array_length(p_voters, 1), (select count(*) from auth.users)::int))
+          coalesce(array_length(p_voters, 1), (select count(*) from auth.users)::int), true)
   returning id into v_id;
 
   insert into public.gh_tally (round_id, target)
@@ -283,6 +300,7 @@ begin
         'voters_count', (select count(*) from public.gh_voted v where v.round_id = r.id),
         'i_voted', exists (select 1 from public.gh_voted v where v.round_id = r.id and v.user_id = v_me),
         'can_vote', (r.voters is null or v_me = any (r.voters)),
+        'admin_sees', r.admin_sees,
         'candidates', (
           select coalesce(jsonb_agg(jsonb_build_object(
             'id', u.id,
@@ -347,6 +365,44 @@ begin
   update public.gh_voted
      set touch = touch + 1
    where round_id = p_round_id;
+
+  -- Solo en las votaciones donde se avisó que el admin lo puede ver.
+  if r.admin_sees then
+    insert into public.gh_admin_log (round_id, voter, target) values (p_round_id, auth.uid(), p_target);
+  end if;
+end;
+$$;
+
+-- Historial de quién votó a quién: solo admin, solo votaciones cerradas con admin_sees.
+create or replace function public.gh_admin_votes()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+begin
+  if not public.gh_is_admin() then
+    raise exception 'Solo el admin puede ver el historial de votos.';
+  end if;
+
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'round_id', r.id,
+      'votes', (
+        select coalesce(jsonb_agg(jsonb_build_object(
+          'voter', coalesce(v.raw_user_meta_data ->> 'full_name', v.raw_user_meta_data ->> 'name', split_part(v.email, '@', 1)),
+          'target', coalesce(t.raw_user_meta_data ->> 'full_name', t.raw_user_meta_data ->> 'name', split_part(t.email, '@', 1))
+        ) order by coalesce(v.raw_user_meta_data ->> 'full_name', v.email)), '[]'::jsonb)
+        from public.gh_admin_log l
+        join auth.users v on v.id = l.voter
+        join auth.users t on t.id = l.target
+        where l.round_id = r.id
+      )
+    ) order by r.created_at desc)
+    from public.gh_rounds r
+    where r.admin_sees and (r.closed_at is not null or r.closes_at <= now())
+  ), '[]'::jsonb);
 end;
 $$;
 
@@ -522,6 +578,7 @@ revoke all on function public.gh_apply_nominees(uuid) from public, anon;
 revoke all on function public.gh_set_statuses(jsonb, boolean) from public, anon;
 revoke all on function public.gh_past_save(int, text) from public, anon;
 revoke all on function public.gh_past_delete(uuid) from public, anon;
+revoke all on function public.gh_admin_votes() from public, anon;
 
 grant execute on function public.gh_state() to authenticated;
 grant execute on function public.gh_vote(uuid, uuid) to authenticated;
@@ -532,3 +589,4 @@ grant execute on function public.gh_apply_nominees(uuid) to authenticated;
 grant execute on function public.gh_set_statuses(jsonb, boolean) to authenticated;
 grant execute on function public.gh_past_save(int, text) to authenticated;
 grant execute on function public.gh_past_delete(uuid) to authenticated;
+grant execute on function public.gh_admin_votes() to authenticated;
