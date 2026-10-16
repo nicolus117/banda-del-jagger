@@ -12,10 +12,13 @@
 --     cuando la votación ya cerró.
 --
 -- Horarios (hora de Argentina):
---   * Se abre sola cada viernes a las 00:00 y se cierra a las 23:59.
+--   * Se abre sola cada jueves a las 22:00 y se cierra el viernes a las 23:59.
 --   * El admin puede abrir una antes o cerrar la abierta cuando quiera.
 --   * Si hay empate, se abre un desempate de 24 horas entre los empatados.
 --     Si vuelve a empatar, otro desempate.
+--
+-- Nominados: el admin elige quiénes se pueden votar (y si votan todos o solo
+-- los nominados). Esa lista se usa en cada votación automática.
 
 -- ---------- Tablas ----------
 create table if not exists public.gh_rounds (
@@ -46,7 +49,20 @@ create table if not exists public.gh_tally (
   primary key (round_id, target)
 );
 
+-- Quiénes pueden votar (vacío = todos los registrados).
+alter table public.gh_rounds add column if not exists voters uuid[];
+
+-- Configuración del admin: una sola fila.
+create table if not exists public.gh_settings (
+  id int primary key default 1 check (id = 1),
+  nominees uuid[],
+  only_nominees_vote boolean not null default false
+);
+insert into public.gh_settings (id) values (1) on conflict (id) do nothing;
+
 alter table public.gh_rounds enable row level security;
+alter table public.gh_settings enable row level security;
+revoke all on public.gh_settings from anon, authenticated;
 alter table public.gh_voted enable row level security;
 alter table public.gh_tally enable row level security;
 revoke all on public.gh_rounds, public.gh_voted, public.gh_tally from anon, authenticated;
@@ -68,9 +84,17 @@ language sql
 immutable
 as $$ select 'America/Argentina/Buenos_Aires'::text $$;
 
+-- Fecha y hora actual en Argentina.
+create or replace function public.gh_local_now()
+returns timestamp
+language sql
+stable
+as $$ select now() at time zone public.gh_tz() $$;
+
 -- Crea una votación con su conteo en cero para cada candidato.
+drop function if exists public.gh_new_round(text, date, uuid, timestamptz, timestamptz, uuid[]);
 create or replace function public.gh_new_round(
-  p_kind text, p_week date, p_parent uuid, p_opens timestamptz, p_closes timestamptz, p_candidates uuid[]
+  p_kind text, p_week date, p_parent uuid, p_opens timestamptz, p_closes timestamptz, p_candidates uuid[], p_voters uuid[]
 )
 returns uuid
 language plpgsql
@@ -80,8 +104,9 @@ as $$
 declare
   v_id uuid;
 begin
-  insert into public.gh_rounds (kind, week_date, parent_id, opens_at, closes_at, candidates, eligible)
-  values (p_kind, p_week, p_parent, p_opens, p_closes, p_candidates, (select count(*) from auth.users))
+  insert into public.gh_rounds (kind, week_date, parent_id, opens_at, closes_at, candidates, voters, eligible)
+  values (p_kind, p_week, p_parent, p_opens, p_closes, p_candidates, p_voters,
+          coalesce(array_length(p_voters, 1), (select count(*) from auth.users)::int))
   returning id into v_id;
 
   insert into public.gh_tally (round_id, target)
@@ -91,7 +116,33 @@ begin
 end;
 $$;
 
--- Abre la votación del viernes y los desempates que hagan falta.
+-- Nominados y votantes según la configuración del admin (solo usuarios que existen).
+create or replace function public.gh_cfg_nominees()
+returns uuid[]
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select coalesce(
+    (select array_agg(u.id) from auth.users u, public.gh_settings s
+     where s.id = 1 and u.id = any (s.nominees)),
+    (select array_agg(id) from auth.users)
+  );
+$$;
+
+create or replace function public.gh_cfg_voters()
+returns uuid[]
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select case when (select only_nominees_vote from public.gh_settings where id = 1)
+              then public.gh_cfg_nominees() end;
+$$;
+
+-- Abre la votación de la semana y los desempates que hagan falta.
 -- Se ejecuta cada vez que alguien entra a la sección.
 create or replace function public.gh_sync()
 returns void
@@ -100,8 +151,9 @@ security definer
 set search_path = public
 as $$
 declare
-  v_local timestamp := now() at time zone public.gh_tz();
+  v_local timestamp := public.gh_local_now();
   v_today date := v_local::date;
+  v_friday date;
   r public.gh_rounds;
   v_max int;
   v_tied uuid[];
@@ -109,15 +161,17 @@ declare
 begin
   perform pg_advisory_xact_lock(hashtext('gh_sync'));
 
-  -- Viernes a las 00:00: votación semanal (si todavía no hay una para este viernes).
-  if extract(isodow from v_local) = 5
-     and not exists (select 1 from public.gh_rounds where kind = 'semanal' and week_date = v_today) then
-    perform public.gh_new_round(
-      'semanal', v_today, null,
-      (v_today::timestamp) at time zone public.gh_tz(),
-      (v_today + time '23:59') at time zone public.gh_tz(),
-      (select array_agg(id) from auth.users)
-    );
+  -- Jueves 22:00 hasta viernes 23:59: votación de la semana (si todavía no hay una).
+  if (extract(isodow from v_local) = 4 and v_local::time >= time '22:00') or extract(isodow from v_local) = 5 then
+    v_friday := case when extract(isodow from v_local) = 4 then v_today + 1 else v_today end;
+    if not exists (select 1 from public.gh_rounds where kind = 'semanal' and week_date = v_friday) then
+      perform public.gh_new_round(
+        'semanal', v_friday, null,
+        ((v_friday - 1) + time '22:00') at time zone public.gh_tz(),
+        (v_friday + time '23:59') at time zone public.gh_tz(),
+        public.gh_cfg_nominees(), public.gh_cfg_voters()
+      );
+    end if;
   end if;
 
   -- Votaciones cerradas que todavía no se revisaron: si hay empate, desempate.
@@ -134,7 +188,7 @@ begin
       if v_end < now() + interval '1 hour' then
         v_end := now() + interval '24 hours';
       end if;
-      perform public.gh_new_round('desempate', r.week_date, r.id, now(), v_end, v_tied);
+      perform public.gh_new_round('desempate', r.week_date, r.id, now(), v_end, v_tied, r.voters);
     end if;
 
     update public.gh_rounds set tie_handled = true where id = r.id;
@@ -143,7 +197,9 @@ end;
 $$;
 
 revoke all on function public.gh_is_admin() from public, anon, authenticated;
-revoke all on function public.gh_new_round(text, date, uuid, timestamptz, timestamptz, uuid[]) from public, anon, authenticated;
+revoke all on function public.gh_new_round(text, date, uuid, timestamptz, timestamptz, uuid[], uuid[]) from public, anon, authenticated;
+revoke all on function public.gh_cfg_nominees() from public, anon, authenticated;
+revoke all on function public.gh_cfg_voters() from public, anon, authenticated;
 revoke all on function public.gh_sync() from public, anon, authenticated;
 
 -- ---------- Leer todo ----------
@@ -162,7 +218,12 @@ begin
 
   perform public.gh_sync();
 
-  return coalesce((
+  return jsonb_build_object(
+    'settings', jsonb_build_object(
+      'nominees', (select to_jsonb(nominees) from public.gh_settings where id = 1),
+      'only_nominees_vote', (select only_nominees_vote from public.gh_settings where id = 1)
+    ),
+    'rounds', coalesce((
     select jsonb_agg(x.j order by x.created_at desc)
     from (
       select r.created_at, jsonb_build_object(
@@ -175,6 +236,7 @@ begin
         'eligible', r.eligible,
         'voters_count', (select count(*) from public.gh_voted v where v.round_id = r.id),
         'i_voted', exists (select 1 from public.gh_voted v where v.round_id = r.id and v.user_id = v_me),
+        'can_vote', (r.voters is null or v_me = any (r.voters)),
         'candidates', (
           select coalesce(jsonb_agg(jsonb_build_object(
             'id', u.id,
@@ -193,7 +255,7 @@ begin
       order by r.created_at desc
       limit 40
     ) x
-  ), '[]'::jsonb);
+  ), '[]'::jsonb));
 end;
 $$;
 
@@ -221,6 +283,9 @@ begin
   if not (p_target = any (r.candidates)) then
     raise exception 'Esa persona no está en esta votación.';
   end if;
+  if r.voters is not null and not (auth.uid() = any (r.voters)) then
+    raise exception 'En esta votación votan solo los nominados.';
+  end if;
 
   begin
     insert into public.gh_voted (round_id, user_id) values (p_round_id, auth.uid());
@@ -247,7 +312,7 @@ security definer
 set search_path = public
 as $$
 declare
-  v_local timestamp := now() at time zone public.gh_tz();
+  v_local timestamp := public.gh_local_now();
   v_friday date;
 begin
   if not public.gh_is_admin() then
@@ -264,7 +329,7 @@ begin
   return public.gh_new_round(
     'semanal', v_friday, null, now(),
     (v_friday + time '23:59') at time zone public.gh_tz(),
-    (select array_agg(id) from auth.users)
+    public.gh_cfg_nominees(), public.gh_cfg_voters()
   );
 end;
 $$;
@@ -290,13 +355,69 @@ begin
 end;
 $$;
 
+-- Guarda los nominados (y quiénes votan) para las próximas votaciones.
+create or replace function public.gh_set_nominees(p_nominees uuid[], p_only_nominees_vote boolean)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.gh_is_admin() then
+    raise exception 'Solo el admin puede elegir a los nominados.';
+  end if;
+  if coalesce(array_length(p_nominees, 1), 0) < 2 then
+    raise exception 'Elegí al menos 2 nominados.';
+  end if;
+  update public.gh_settings
+     set nominees = p_nominees, only_nominees_vote = coalesce(p_only_nominees_vote, false)
+   where id = 1;
+end;
+$$;
+
+-- Aplica la lista de nominados a una votación abierta en la que todavía nadie votó.
+create or replace function public.gh_apply_nominees(p_round_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  r public.gh_rounds;
+begin
+  if not public.gh_is_admin() then
+    raise exception 'Solo el admin puede cambiar los nominados.';
+  end if;
+  select * into r from public.gh_rounds where id = p_round_id for update;
+  if not found or r.kind <> 'semanal' or r.closed_at is not null or now() >= r.closes_at then
+    raise exception 'Solo se puede en una votación semanal abierta.';
+  end if;
+  if exists (select 1 from public.gh_voted where round_id = p_round_id) then
+    raise exception 'Ya votó alguien: los nominados de esta votación no se pueden cambiar.';
+  end if;
+
+  update public.gh_rounds
+     set candidates = public.gh_cfg_nominees(),
+         voters = public.gh_cfg_voters(),
+         eligible = coalesce(array_length(public.gh_cfg_voters(), 1), (select count(*) from auth.users)::int)
+   where id = p_round_id;
+  delete from public.gh_tally where round_id = p_round_id;
+  insert into public.gh_tally (round_id, target)
+  select p_round_id, x from unnest(public.gh_cfg_nominees()) as x;
+end;
+$$;
+
 -- ---------- Permisos ----------
 revoke all on function public.gh_state() from public, anon;
 revoke all on function public.gh_vote(uuid, uuid) from public, anon;
 revoke all on function public.gh_open_now() from public, anon;
 revoke all on function public.gh_close_now(uuid) from public, anon;
+revoke all on function public.gh_set_nominees(uuid[], boolean) from public, anon;
+revoke all on function public.gh_apply_nominees(uuid) from public, anon;
 
 grant execute on function public.gh_state() to authenticated;
 grant execute on function public.gh_vote(uuid, uuid) to authenticated;
 grant execute on function public.gh_open_now() to authenticated;
 grant execute on function public.gh_close_now(uuid) to authenticated;
+grant execute on function public.gh_set_nominees(uuid[], boolean) to authenticated;
+grant execute on function public.gh_apply_nominees(uuid) to authenticated;
