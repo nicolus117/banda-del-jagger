@@ -71,6 +71,18 @@ update public.gh_settings
    set statuses = (select coalesce(jsonb_object_agg(x::text, 'participante'), '{}'::jsonb) from unnest(nominees) as x)
  where id = 1 and statuses = '{}'::jsonb and nominees is not null;
 
+-- Historial de antes de la página (se carga a mano).
+create table if not exists public.gh_past (
+  id uuid primary key default gen_random_uuid(),
+  week int not null unique check (week > 0),
+  name text not null check (char_length(name) between 1 and 40)
+);
+insert into public.gh_past (week, name) values
+  (1, 'Jero'), (2, 'Aldi'), (3, 'Agus'), (4, 'Mili')
+on conflict (week) do nothing;
+alter table public.gh_past enable row level security;
+revoke all on public.gh_past from anon, authenticated;
+
 alter table public.gh_rounds enable row level security;
 alter table public.gh_settings enable row level security;
 revoke all on public.gh_settings from anon, authenticated;
@@ -244,6 +256,8 @@ begin
       'statuses', (select statuses from public.gh_settings where id = 1),
       'only_nominees_vote', (select only_nominees_vote from public.gh_settings where id = 1)
     ),
+    'past', (select coalesce(jsonb_agg(jsonb_build_object('id', p.id, 'week', p.week, 'name', p.name) order by p.week desc), '[]'::jsonb)
+             from public.gh_past p),
     -- La casa: visible para todos.
     'house', (
       select coalesce(jsonb_agg(jsonb_build_object(
@@ -436,6 +450,36 @@ begin
 end;
 $$;
 
+-- Historial de antes de la página: agregar/corregir y borrar (solo admin).
+create or replace function public.gh_past_save(p_week int, p_name text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.gh_is_admin() then
+    raise exception 'Solo el admin puede editar el historial.';
+  end if;
+  insert into public.gh_past (week, name) values (p_week, left(btrim(p_name), 40))
+  on conflict (week) do update set name = excluded.name;
+end;
+$$;
+
+create or replace function public.gh_past_delete(p_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.gh_is_admin() then
+    raise exception 'Solo el admin puede editar el historial.';
+  end if;
+  delete from public.gh_past where id = p_id;
+end;
+$$;
+
 -- Aplica la lista de nominados a una votación abierta en la que todavía nadie votó.
 create or replace function public.gh_apply_nominees(p_round_id uuid)
 returns void
@@ -476,6 +520,8 @@ revoke all on function public.gh_close_now(uuid) from public, anon;
 revoke all on function public.gh_set_nominees(uuid[], boolean) from public, anon;
 revoke all on function public.gh_apply_nominees(uuid) from public, anon;
 revoke all on function public.gh_set_statuses(jsonb, boolean) from public, anon;
+revoke all on function public.gh_past_save(int, text) from public, anon;
+revoke all on function public.gh_past_delete(uuid) from public, anon;
 
 grant execute on function public.gh_state() to authenticated;
 grant execute on function public.gh_vote(uuid, uuid) to authenticated;
@@ -484,3 +530,5 @@ grant execute on function public.gh_close_now(uuid) to authenticated;
 grant execute on function public.gh_set_nominees(uuid[], boolean) to authenticated;
 grant execute on function public.gh_apply_nominees(uuid) to authenticated;
 grant execute on function public.gh_set_statuses(jsonb, boolean) to authenticated;
+grant execute on function public.gh_past_save(int, text) to authenticated;
+grant execute on function public.gh_past_delete(uuid) to authenticated;
